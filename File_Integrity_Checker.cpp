@@ -1,18 +1,30 @@
-#include  <iostream> 
-#include  <string> 
-#include  <unistd.h> 
-#include  <fcntl.h>
+#include <iostream>
+#include <string>
+#include <unistd.h>
+#include <fcntl.h>
 #include <linux/input.h>
 #include <fstream>
 #include <openssl/sha.h>
-#include  <cerrno>
+#include <cerrno>
 #include <cstring>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <map>
 
-// Computes the SHA-256 hash of a file and returns it as a
-// 64-character hexadecimal string. Reads the file in 4096-byte
-// chunks so it works efficiently even on very large files.
+bool g_daemon = false;
+
+std::map<std::string, std::string> last_alerted;
+
+// Computes the SHA-256 hash of a file by reading it in 4096-byte chunks
+// and returns it as a 64-character hex string. Returns an empty string
+// if the file cannot be opened.
 std::string hash_core(std::string& filename) {
     std::ifstream file(filename, std::ios::binary);
+    if (!file) {
+        std::cerr << "Error: cannot open \"" << filename << "\"" << std::endl;
+        return "";
+    }
     SHA256_CTX sha;
     SHA256_Init(&sha);
     char buffer[4096];
@@ -31,44 +43,49 @@ std::string hash_core(std::string& filename) {
     return std::string(hex_output);
 }
 
-// Compares two hashes and prints whether the file has changed.
-void compare_hash(std::string& old_hash,std::string new_hash) {
-    if(old_hash == new_hash) {
-        std::cout << "No changes have been made to the file" << std::endl ;
-    }
-    else if(old_hash != new_hash) {
-        std::cout << "Mismatch: The file contains changes!!" << std::endl ;
-    }
+// Returns true if the two hashes are identical (file unchanged),
+// and false if they differ (file modified).
+bool compare_hash(const std::string& old_hash, const std::string& new_hash) {
+    return old_hash == new_hash;
 }
 
-// Copies the given file to "backup_file.txt" using raw Linux
-// syscalls (open/read/write/close), reading and writing in
-// 4096-byte chunks so it works for files of any size.
+// Copies a file to "<file_name>.bak" using raw Linux syscalls
+// (open/read/write/close) in 4096-byte chunks, overwriting any
+// previous backup and checking that every write succeeds.
 void create_backup(std::string file_name) {
     char buffer[4096] ;
-    int file_sourc = open(file_name.c_str(),O_RDONLY) ;
-    if(file_sourc < 0 ) {
+    int file_source = open(file_name.c_str(),O_RDONLY) ;
+    if(file_source < 0 ) {
         std::cout << "Error: " << strerror(errno) << std::endl ;
-        close(file_sourc) ;
         return;
     }
-    int fd = open("backup_file.txt",O_CREAT |O_WRONLY| O_APPEND,0644) ;
+    std::string backup_name = file_name + ".bak";
+    int fd = open(backup_name.c_str(),O_CREAT |O_WRONLY| O_TRUNC,0644) ;
         if(fd < 0) {
-        std::cout << "Erorr: " << strerror(errno) << std::endl ;
-        close(file_sourc) ;
+        std::cout << "Error: " << strerror(errno) << std::endl ;
+        close(file_source) ;
         return;
     }
     ssize_t n ;
-    while ((n = read(file_sourc,buffer,sizeof(buffer))) > 0) {
-        write(fd,buffer,n) ;
+    while ((n = read(file_source,buffer,sizeof(buffer))) > 0) {
+        ssize_t written = 0;
+        while (written < n) {
+            ssize_t w = write(fd,buffer + written,n - written) ;
+            if (w < 0) {
+                std::cout << "Error: " << strerror(errno) << std::endl ;
+                close(fd) ;
+                close(file_source) ;
+                return;
+            }
+            written += w;
+        }
     }
     close(fd) ;
-    close(file_sourc) ;
+    close(file_source) ;
 }
 
-// Reads a previously saved hash from the baseline file.
-// Returns an empty string if the baseline file doesn't exist
-// yet (meaning this file has never been checked before).
+// Reads the previously saved hash from a baseline file. Returns an
+// empty string if the baseline does not exist yet (first run).
 std::string load_baseline(const std::string& baseline_path) {
     std::ifstream baseline_file(baseline_path);
     std::string saved_hash;
@@ -78,63 +95,135 @@ std::string load_baseline(const std::string& baseline_path) {
     return saved_hash;
 }
 
-// Writes the given hash to the baseline file, overwriting
-// (truncating) any previous content, so the next run can
-// compare against this saved value.
+// Writes a hash to the baseline file, replacing any previous content,
+// so the next check can compare against it.
 void save_baseline(const std::string& baseline_path, const std::string& hash) {
     std::ofstream baseline_file(baseline_path, std::ios::trunc);
     baseline_file << hash;
 }
 
+// Shows a desktop notification by running the "notify-send" command
+// in a child process, and waits for it to finish.
+void send_alert(const std::string& title, const std::string& message, bool critical) {
+    pid_t pid = fork();
+    if (pid < 0) {
+        std::cerr << "Error: fork failed: " << strerror(errno) << std::endl;
+        return;
+    }
+    if (pid == 0) {
+        execlp("notify-send", "notify-send",
+               "-u", critical ? "critical" : "normal",
+               title.c_str(), message.c_str(), (char*)nullptr);
+        _exit(1);
+    }
+    waitpid(pid, nullptr, 0);
+}
+
+// Runs the full check for one file: hashes it, compares with the saved
+// baseline, and handles the result. On first run it saves a baseline and
+// backup. On a change it sends an alert; in daemon mode it alerts once per
+// change, otherwise it asks the user whether to accept the change.
+void process_file(std::string filename) {
+    char answer = 'n';
+    std::string baseline = filename + ".baseline";
+    std::string new_hash = hash_core(filename);
+    if (new_hash.empty()) {
+        return;
+    }
+    std::string old_hash = load_baseline(baseline);
+    if (old_hash.empty()) {
+        std::cout << "First Run..." << std::endl;
+        save_baseline(baseline, new_hash);
+        create_backup(filename);
+    }
+    else {
+        if (!compare_hash(old_hash, new_hash)) {
+            std::cout << "Error file has been changed!!" << std::endl;
+            if (g_daemon) {
+                if (last_alerted[filename] != new_hash) {
+                    send_alert("File changed", "The file \"" + filename + "\" has been modified.", true);
+                    last_alerted[filename] = new_hash;
+                }
+                return;
+            }
+            send_alert("File changed", "The file \"" + filename + "\" has been modified.", true);
+            std::cout << "Did you change it (Y / n) ? : ";
+            std::cin >> answer;
+            if (answer == 'Y' || answer == 'y') {
+                std::cout << "Baseline and backup updated..." << std::endl;
+                save_baseline(baseline, new_hash);
+                create_backup(filename);
+            }
+            else {
+                std::cout << "WARNING: change rejected. The file \"" << filename
+                          << "\" differs from its baseline." << std::endl;
+                std::cout << "The original copy is still saved in \"" << filename
+                          << ".bak\"." << std::endl;
+            }
+        }
+    }
+}
+
+// Goes through every regular file in a directory (not recursive) and
+// calls process_file() on each, skipping ".", "..", and the tool's own
+// ".baseline" and ".bak" files.
+void scan_directory(std::string dir_path) {
+    DIR* dir = opendir(dir_path.c_str());
+    if (dir == nullptr) {
+        std::cout << "Error: " << strerror(errno) << std::endl;
+        return;
+    }
+
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        std::string name = entry->d_name;
+
+        bool is_baseline_file = name.size() >= 9 && name.substr(name.size() - 9) == ".baseline";
+        bool is_backup_file = name.size() >= 4 && name.substr(name.size() - 4) == ".bak";
+
+        if (name == "." || name == ".." || is_baseline_file || is_backup_file) {
+            continue;
+        }
+
+        std::string filename = dir_path + "/" + name;
+        struct stat entry_info;
+        if (stat(filename.c_str(), &entry_info) != 0 || !S_ISREG(entry_info.st_mode)) {
+            continue;
+        }
+        process_file(filename);
+    }
+
+    closedir(dir);
+}
+
+// Entry point. Reads the file or directory path (and the optional
+// --daemon flag) from the command line, then checks the target in an
+// endless loop every 10 seconds until stopped with Ctrl+C.
 int main(int argc, char* argv[]) {
-    // argc counts how many words were typed on the command
-    // line, including the program name itself. If the user
-    // didn't provide a file path, argc will be less than 2,
-    // so we print usage instructions and stop.
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <filename>" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <file_or_directory>" << std::endl;
         return 1;
     }
 
-    // argv[1] is the first argument after the program name —
-    // the path to the file the user wants to monitor.
-    std::string filename = argv[1];
-
-    // Build the name of this file's baseline file by appending
-    // ".baseline" to the original filename, e.g.
-    // "test.txt" -> "test.txt.baseline"
-    std::string baseline_path = filename + ".baseline";
-
-    // Step 1: compute the current hash of the target file.
-    std::string current_hash = hash_core(filename);
-
-    // Step 2: try to load a hash that was saved on a previous
-    // run. This will be empty if no baseline exists yet.
-    std::string old_hash = load_baseline(baseline_path);
-
-    if (old_hash.empty()) {
-        // No previous baseline found: this is the first time
-        // this file is being monitored. Save the current hash
-        // as the new baseline and take an initial backup.
-        std::cout << "First run: establishing baseline for \"" << filename << "\"" << std::endl;
-        save_baseline(baseline_path, current_hash);
-        create_backup(filename);
-        std::cout << "Baseline hash: " << current_hash << std::endl;
-    } else {
-        // A previous baseline exists: compare it against the
-        // current hash and report whether the file changed.
-        compare_hash(old_hash, current_hash);
-
-        if (old_hash != current_hash) {
-            // The file changed since the last check: update
-            // the stored baseline and take a fresh backup so
-            // future comparisons use the new content as the
-            // reference point.
-            save_baseline(baseline_path, current_hash);
-            create_backup(filename);
-            std::cout << "Baseline and backup updated." << std::endl;
-        }
+    std::string path = argv[1];
+    if (access(path.c_str(), F_OK) != 0) {
+        std::cerr << "Error: \"" << path << "\" does not exist." << std::endl;
+        return 1;
     }
 
-    return 0;
+    struct stat path_info;
+    stat(path.c_str(), &path_info);
+
+    if (argc >= 3 && std::string(argv[2]) == "--daemon") {
+        g_daemon = true;
+    }
+
+    while (true) {
+        if (S_ISDIR(path_info.st_mode)) {
+            scan_directory(path);
+        } else {
+            process_file(path);
+        }
+        sleep(10);
+    }
 }
