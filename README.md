@@ -1,68 +1,33 @@
 # File Integrity Checker
 
-A command-line C++ tool that monitors a file for unauthorized
-changes. It computes a SHA-256 fingerprint of the file, stores
-it as a baseline, and on every later run compares the current
-fingerprint against that baseline — alerting you if the file's
-content has changed, and automatically keeping a backup copy.
+A command-line C++ tool for Linux that detects unauthorized changes to files.
+It computes a SHA-256 fingerprint (hash) of a file, stores it as a **baseline**,
+and compares the file against that baseline on later checks. When something
+changes, the tool alerts you and keeps a backup copy of the last trusted version.
 
-This is the same core principle used by real-world file
-integrity monitoring tools such as Tripwire and AIDE.
+This is the same core principle used by real-world file integrity monitoring
+tools such as Tripwire and AIDE.
 
-## How It Works
+The project went through two versions:
 
-1. **First run** — the tool computes the file's SHA-256 hash,
-   saves it to a baseline file, and takes an initial backup.
-2. **Every later run** — the tool recomputes the hash and
-   compares it to the saved baseline:
-   - If they match, the file is unchanged.
-   - If they differ, the tool reports a mismatch, updates the
-     baseline to the new hash, and saves a fresh backup.
+| | **v1 (initial)** | **v2 (final)** |
+|---|---|---|
+| Targets | One file | One file **or a whole directory** |
+| Running | Single check, then exits | Runs continuously, checking every 10 seconds |
+| On change | Prints a message and **automatically** updates baseline and backup | Prints a message, sends a **desktop notification**, and **asks you** before updating |
+| Backup file | One shared `backup_file.txt`, new content **appended** each time | One `<filename>.bak` per file, **overwritten** on update |
+| Unattended mode | No | `--daemon` flag (no prompts, alerts once per change) |
+| Missing/unreadable file | Silently hashes it as empty | Reports an error and skips it |
+| Write errors in backup | Not checked | Checked, including partial writes |
 
-## Code Walkthrough
-
-### `hash_core(filename)`
-Opens the file in binary mode and computes its SHA-256 hash by
-reading it in 4096-byte chunks, feeding each chunk into the
-hashing algorithm incrementally (`SHA256_Init` /
-`SHA256_Update` / `SHA256_Final`). This streaming approach
-means the file never has to be fully loaded into memory, so it
-works efficiently on files of any size. Returns the hash as a
-64-character hexadecimal string.
-
-### `compare_hash(old_hash, new_hash)`
-Compares two hash strings and prints whether the file has
-changed or remained identical.
-
-### `create_backup(file_name)`
-Copies the target file to `backup_file.txt` using raw Linux
-syscalls (`open`, `read`, `write`, `close`) instead of C++
-stream objects — reading and writing in a loop, 4096 bytes at a
-time, so the copy works correctly regardless of file size.
-
-### `load_baseline(baseline_path)`
-Reads a previously saved hash from the file's `.baseline` file.
-Returns an empty string if no baseline exists yet, which tells
-the program this is the first time the file is being monitored.
-
-### `save_baseline(baseline_path, hash)`
-Writes the current hash to the `.baseline` file, overwriting
-any previous value, so the next run has something to compare
-against.
-
-### `main()`
-Ties everything together:
-1. Reads the target filename from the command line (`argv[1]`).
-2. Builds the baseline file path (`<filename>.baseline`).
-3. Computes the current hash and loads the saved baseline hash.
-4. If no baseline exists, saves one and takes an initial
-   backup. Otherwise, compares old vs. new hash and, if they
-   differ, updates the baseline and takes a new backup.
+---
 
 ## Requirements
 
+- Linux
 - A C++ compiler (`g++`)
 - OpenSSL development headers (`libssl-dev` on Debian/Ubuntu)
+- `notify-send` for desktop alerts in v2 (`libnotify-bin` on Debian/Ubuntu)
 
 ## Build
 
@@ -70,77 +35,171 @@ Ties everything together:
 g++ File_Integrity_Checker.cpp -o checker -lcrypto
 ```
 
-## Usage
+---
+
+## Final version (v2)
+
+### How it works
+
+1. **First check of a file**: the tool hashes the file, saves the hash to
+   `<filename>.baseline`, and saves a backup to `<filename>.bak`.
+2. **Every later check**: the tool recomputes the hash and compares it to the baseline.
+   - Same hash: nothing happens.
+   - Different hash: the tool prints a warning and sends a desktop notification.
+3. **Deciding what to do with a change** (interactive mode):
+   - Answer `Y`: the new content is accepted, so the baseline and backup are updated.
+   - Answer `n`: the change is rejected, the baseline stays as it was, and the
+     `.bak` file still holds the original trusted copy.
+4. The whole process repeats every **10 seconds** until you stop it with `Ctrl+C`.
+
+### Usage
 
 ```bash
-./checker <filename>
+./checker <file_or_directory>            # interactive: asks before accepting changes
+./checker <file_or_directory> --daemon   # unattended: no prompts
 ```
 
-## Example Run
+In **directory mode**, every regular file directly inside the directory is
+monitored (subdirectories are not entered). The tool ignores its own
+`.baseline` and `.bak` files.
+
+In **`--daemon` mode**, the tool never asks questions. When a file changes, it
+sends one desktop notification for that change (not one every 10 seconds) and
+leaves the baseline untouched, so the file stays marked as modified.
+
+### Example (interactive)
 
 Input file `demo2.txt`:
 ```
 Hello linux, this is a config file.
 ```
 
-**Run 1 — first time monitoring the file:**
 ```bash
 ./checker demo2.txt
 ```
-Output:
+
+First check:
+```
+First Run...
+```
+
+Now, from another terminal, modify the file:
+```bash
+echo "Malicious line added!" >> demo2.txt
+```
+
+Within 10 seconds the tool reports:
+```
+Error file has been changed!!
+Did you change it (Y / n) ? :
+```
+
+Answering `n`:
+```
+WARNING: change rejected. The file "demo2.txt" differs from its baseline.
+The original copy is still saved in "demo2.txt.bak".
+```
+
+Answering `Y`:
+```
+Baseline and backup updated...
+```
+
+Files produced:
+```
+demo2.txt            - the monitored file
+demo2.txt.baseline   - the trusted reference hash
+demo2.txt.bak        - backup of the last trusted version
+```
+
+### Code walkthrough
+
+| Function | What it does |
+|---|---|
+| `hash_core` | Computes the SHA-256 hash of a file, reading it in 4096-byte chunks (`SHA256_Init` / `Update` / `Final`) so large files are never loaded fully into memory. Returns an empty string if the file can't be opened. |
+| `compare_hash` | Returns `true` if two hashes match. |
+| `create_backup` | Copies a file to `<name>.bak` using raw Linux syscalls (`open`, `read`, `write`, `close`), overwriting the old backup and checking every write. |
+| `load_baseline` | Reads the saved hash from `<name>.baseline`; returns an empty string if none exists (meaning first run). |
+| `save_baseline` | Writes a hash to the baseline file, replacing the old value. |
+| `send_alert` | Runs `notify-send` in a child process (`fork` + `execlp`) to show a desktop notification. |
+| `process_file` | The main logic for one file: hash, compare, alert, and optionally update baseline and backup. |
+| `scan_directory` | Runs `process_file` on every regular file in a directory, skipping `.`, `..`, `.baseline` and `.bak` files. |
+| `main` | Reads the path and the optional `--daemon` flag, then loops forever, checking every 10 seconds. |
+
+### Limitations
+
+- The baseline and backup are stored next to the monitored file, so someone who
+  can modify the file can also modify them. For real protection, keep them
+  somewhere write-protected.
+- Directory scanning is not recursive.
+- In interactive mode, if you answer `n`, the same question appears again on the
+  next cycle because the file still differs from its baseline.
+- Desktop notifications need a desktop session; `notify-send` may not work from
+  cron, SSH, or a root shell.
+- The first run trusts the file as it is. If it was already tampered with, that
+  state becomes the baseline.
+- `SHA256_Init`, `SHA256_Update` and `SHA256_Final` are deprecated since
+  OpenSSL 3.0 in favor of the `EVP` interface, but still work.
+
+### Possible next steps
+
+- Recursive directory scanning
+- Use `inotify` for instant detection instead of polling every 10 seconds
+- Timestamped backups to keep a version history
+- Switch to the `EVP` SHA-256 interface
+- Make the check interval configurable
+
+---
+
+## Initial version (v1)
+
+The first version was a simple one-shot checker for a single file.
+
+### How it worked
+
+1. **First run**: computed the file's SHA-256 hash, saved it to `<filename>.baseline`,
+   and made a backup.
+2. **Every later run**: recomputed the hash and compared it to the baseline.
+   - Same hash: printed that nothing changed.
+   - Different hash: printed a mismatch, then **automatically** updated the
+     baseline and made a new backup.
+
+Each run checked once and exited, so you had to run it manually every time.
+
+### Usage
+
+```bash
+./checker <filename>
+```
+
+### Example
+
+```bash
+./checker demo2.txt
+```
 ```
 First run: establishing baseline for "demo2.txt"
 Baseline hash: 2a1afb6900d06571c223eb66e9c7f4b7effdb73d77fbd77248759308fa2eb14d
 ```
 
-**Run 2 — running again with no changes:**
-```bash
-./checker demo2.txt
-```
-Output:
+Running again with no changes:
 ```
 No changes have been made to the file
 ```
 
-**The file is then modified:**
-```bash
-echo "Malicious line added!" >> demo2.txt
-```
-
-**Run 3 — after modification:**
-```bash
-./checker demo2.txt
-```
-Output:
+After `echo "Malicious line added!" >> demo2.txt`:
 ```
 Mismatch: The file contains changes!!
 Baseline and backup updated.
 ```
 
-**Files produced after these runs:**
-```
-demo2.txt            — the monitored file
-demo2.txt.baseline   — stores the current reference hash
-backup_file.txt      — a backup copy taken whenever a change is detected
-```
+### Problems found in v1 (fixed in v2)
 
-## Notes & Limitations
-
-- `SHA256_Init`, `SHA256_Update`, and `SHA256_Final` are marked
-  deprecated as of OpenSSL 3.0 in favor of the newer `EVP`
-  interface, but remain fully functional here.
-- `create_backup` currently appends to `backup_file.txt` rather
-  than creating uniquely named, timestamped backups, so only
-  the most recent backup set is easily distinguishable.
-- The tool currently monitors one file per run; it does not yet
-  support watching multiple files or running continuously in
-  the background.
-
-## Possible Next Steps
-
-- Accept a list of files (or a directory) to monitor at once
-- Use `inotify` to detect changes in real time instead of
-  running the check manually
-- Timestamp each backup so a history of versions is kept
-- Add an `EVP`-based SHA-256 implementation to replace the
-  deprecated API
+- The backup was taken **after** a change was detected, so it contained the
+  modified (possibly malicious) content instead of the trusted one.
+- The baseline was updated automatically, so the next run reported "no changes"
+  even though the file was still modified.
+- The backup was opened with `O_APPEND`, so `backup_file.txt` accumulated every
+  version one after another, and all monitored files shared the same backup name.
+- A missing file was silently hashed as an empty file.
+- The return value of `write()` was not checked.
